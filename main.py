@@ -8,7 +8,6 @@ import imaplib
 import email
 import re
 from email.header import make_header, decode_header
-
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 import smtplib
@@ -66,13 +65,14 @@ IMAP_EMAIL = os.environ.get("IMAP_EMAIL")
 IMAP_AUTH_CODE = os.environ.get("IMAP_AUTH_CODE")
 IMAP_SERVER = os.environ.get("IMAP_SERVER")
 TARGET_FOLDER = os.environ.get("TARGET_FOLDER")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") # 这里不用改，因为Secrets名就是这个
+BASE_URL = os.environ.get("BASE_URL", "https://api.deepseek.com/v1") # 新增：读取你的Agens地址
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_AUTH_CODE = os.environ.get("SENDER_AUTH_CODE")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 SMTP_SERVER = os.environ.get("SMTP_SERVER")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
+LLM_MODEL = os.environ.get("LLM_MODEL", "agnes-2.5-flash") # 修改：默认模型换成你的模型
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", 0))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 4096))
 
@@ -81,14 +81,9 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 4096))
 # ==============================================================================
 
 def _decode_part_payload(part):
-    """
-    解码单个邮件 part 的 payload。
-    优先使用 part 自身声明的 charset，失败后回退到 utf-8、gb18030。
-    """
     payload = part.get_payload(decode=True)
     if payload is None:
         return ""
-
     charsets = [part.get_content_charset(), "utf-8", "gb18030"]
     for charset in charsets:
         if not charset:
@@ -97,45 +92,29 @@ def _decode_part_payload(part):
             return payload.decode(charset)
         except (LookupError, UnicodeDecodeError):
             continue
-
     return payload.decode("utf-8", errors="ignore")
 
-
 def _strip_html_tags(html_text):
-    """
-    轻量去除 HTML 标签并清理空白。
-    """
     if not html_text:
         return ""
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html_text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-
 def _extract_body_preview(msg, max_len=1500):
-    """
-    提取邮件正文预览：
-    1) multipart 时跳过附件；2) 优先 text/plain，回退 text/html；
-    3) 解码按 charset -> utf-8 -> gb18030；4) payload None 防护；
-    5) 最终统一截断并清理空白。
-    """
     plain_candidates = []
     html_candidates = []
-
     parts = msg.walk() if msg.is_multipart() else [msg]
     for part in parts:
         content_disposition = (part.get("Content-Disposition") or "").lower()
         if "attachment" in content_disposition:
             continue
-
         content_type = part.get_content_type()
         if content_type not in ("text/plain", "text/html"):
             continue
-
         decoded_text = _decode_part_payload(part)
         if not decoded_text:
             continue
-
         if content_type == "text/plain":
             plain_candidates.append(decoded_text)
         elif content_type == "text/html":
@@ -152,17 +131,13 @@ def _extract_body_preview(msg, max_len=1500):
     return body[:max_len]
 
 def get_emails_from_target_date(target_date):
-    """
-    通过IMAP连接到邮箱，获取指定日期的邮件。
-    采用“客户端过滤”策略，并在过滤前将所有邮件时间统一到北京时区，以确保准确性。
-    对邮件头和正文的解码增加了容错处理。
-    """
     mail_list = []
     beijing_tz = timezone(timedelta(hours=8))
-
     try:
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
-        conn.login(IMAP_EMAIL, IMAP_AUTH_CODE)
+        # 去除授权码中可能存在的空格
+        clean_auth_code = IMAP_AUTH_CODE.replace(" ", "")
+        conn.login(IMAP_EMAIL, clean_auth_code)
         conn.select(f'"{TARGET_FOLDER}"')
         
         fetch_since_dt = target_date - timedelta(days=2)
@@ -180,13 +155,11 @@ def get_emails_from_target_date(target_date):
         for email_id in reversed(email_ids):
             _, msg_data = conn.fetch(email_id, "(RFC822)")
             msg = email.message_from_bytes(msg_data[0][1])
-
             try:
                 date_header = msg.get("Date")
                 if not date_header: continue
                 
                 email_dt_original = parsedate_to_datetime(date_header)
-                
                 if email_dt_original.tzinfo is None:
                     email_dt_in_beijing = email_dt_original.replace(tzinfo=timezone.utc).astimezone(beijing_tz)
                 else:
@@ -204,7 +177,6 @@ def get_emails_from_target_date(target_date):
                     from_ = "(未知发件人)"
 
                 body_preview = _extract_body_preview(msg)
-
                 mail_list.append({ "from_sender": from_, "subject": subject, "body_preview": body_preview })
             except Exception as e:
                 print(f"解析邮件 {email_id.decode()} 时出错: {e}")
@@ -218,31 +190,23 @@ def get_emails_from_target_date(target_date):
         return []
 
 def _extract_status_code(exception):
-    """从异常对象中尽力提取HTTP状态码。"""
     status_code = getattr(exception, "status_code", None)
     if status_code is not None:
         return status_code
-
     response = getattr(exception, "response", None)
     if response is not None:
         return getattr(response, "status_code", None)
-
     return None
 
-
 def _is_retryable_exception(exception):
-    """判断当前异常是否可重试（网络超时、429、5xx）。"""
     status_code = _extract_status_code(exception)
     if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
         return True
-
     exception_text = str(exception).lower()
     timeout_signals = ["timeout", "timed out", "readtimeout", "connecttimeout", "网络超时"]
     return any(signal in exception_text for signal in timeout_signals)
 
-
 def _build_batch_error_block(start_index, batch_size, exception):
-    """构建结构化错误块，避免失败被静默吞掉。"""
     batch_end = start_index + batch_size - 1
     exception_type = type(exception).__name__
     status_code = _extract_status_code(exception)
@@ -261,13 +225,8 @@ def _build_batch_error_block(start_index, batch_size, exception):
         "---"
     )
 
-
 def summarize_single_batch(client, email_batch, start_index, max_retries=3, base_delay=2):
-    """
-    【辅助函数】使用统一的SYSTEM_PROMPT，处理单批次的邮件。
-    """
     emails_json_str = json.dumps(email_batch, ensure_ascii=False, indent=2)
-    
     prompt_filled = SYSTEM_PROMPT.replace("{{emails}}", emails_json_str)
     prompt_filled = prompt_filled.replace("{{start_index}}", str(start_index))
     
@@ -288,12 +247,9 @@ def summarize_single_batch(client, email_batch, start_index, max_retries=3, base
             should_retry = attempt < max_retries and _is_retryable_exception(e)
             if should_retry:
                 retry_delay = base_delay * (2 ** attempt)
-                print(
-                    f"处理批次 (起始序号 {start_index}) 第 {attempt + 1} 次调用失败，将在 {retry_delay}s 后重试: {e}"
-                )
+                print(f"处理批次 (起始序号 {start_index}) 第 {attempt + 1} 次调用失败，将在 {retry_delay}s 后重试: {e}")
                 time.sleep(retry_delay)
                 continue
-
             print(f"处理批次 (起始序号 {start_index}) 最终失败: {e}")
             return {
                 "success": False,
@@ -304,17 +260,13 @@ def summarize_single_batch(client, email_batch, start_index, max_retries=3, base
                 },
             }
 
-
 def summarize_with_llm(email_list, batch_size=25, max_retries=3, base_delay=2):
-    """
-    协调分批处理邮件列表的总结任务。
-    """
     if not email_list:
         return "### 每日邮件汇总\n**总览：共 0 封邮件**\n\n--- \n\n今日没有收到新邮件。"
         
     client = openai.OpenAI(
         api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com/v1"
+        base_url=BASE_URL # 使用环境变量中的 BASE_URL
     )
     
     total_emails = len(email_list)
@@ -344,14 +296,9 @@ def summarize_with_llm(email_list, batch_size=25, max_retries=3, base_delay=2):
         f"**总览：共 {total_emails} 封邮件，处理失败批次 {failed_batches} 个**\n\n"
         "---"
     )
-
     return "\n".join([overview] + report_parts)
 
-
 def send_email_notification(summary_md, date_for_subject):
-    """
-    将Markdown报告转换为HTML并通过SMTP (STARTTLS) 发送。
-    """
     if not SENDER_EMAIL or not SENDER_AUTH_CODE or not RECEIVER_EMAIL:
         print("发送邮件所需的环境变量不完整，跳过发送。")
         return
@@ -365,8 +312,8 @@ def send_email_notification(summary_md, date_for_subject):
     message['To'] = RECEIVER_EMAIL
 
     try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30)
-        server.starttls()
+        # 修复 465 端口必须用 SMTP_SSL 的问题
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30)
         server.login(SENDER_EMAIL, SENDER_AUTH_CODE)
         server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], message.as_string())
         server.quit()
@@ -379,7 +326,7 @@ def send_email_notification(summary_md, date_for_subject):
 # ==============================================================================
 if __name__ == "__main__":
     required_vars = ["IMAP_EMAIL", "IMAP_AUTH_CODE", "TARGET_FOLDER", "DEEPSEEK_API_KEY", 
-                     "SENDER_EMAIL", "SENDER_AUTH_CODE", "RECEIVER_EMAIL", "SMTP_SERVER", "SMTP_PORT"]
+                     "SENDER_EMAIL", "SENDER_AUTH_CODE", "RECEIVER_EMAIL", "SMTP_SERVER", "SMTP_PORT", "BASE_URL"]
     if not all(os.environ.get(var) for var in required_vars):
         print("错误：一个或多个必要的环境变量未设置。")
         exit(1)
@@ -387,7 +334,6 @@ if __name__ == "__main__":
     print(f"任务启动于 (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
     
     beijing_timezone = timezone(timedelta(hours=8))
-    # 使用带时区的 now() 以确保夏令时等边缘情况的准确性
     beijing_now = datetime.now(beijing_timezone)
     
     target_day = beijing_now - timedelta(days=1)
