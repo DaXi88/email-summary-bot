@@ -117,11 +117,17 @@ def get_emails_from_target_date(target_date):
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
         conn.login(IMAP_EMAIL, IMAP_AUTH_CODE.replace(" ", ""))
         conn.select(f'"{TARGET_FOLDER}"')
-        # 搜索最近3天的邮件，防止服务器时间偏差
-        fetch_since_str = (target_date - timedelta(days=3)).strftime("%d-%b-%Y")
-        status, messages = conn.search(None, f'(SINCE "{fetch_since_str}")')
-        if status != "OK": return []
         
+        # 🎯 精准限定：只搜索“目标日期”当天的邮件（SINCE 目标日期 BEFORE 目标日期+1天）
+        since_str = target_date.strftime("%d-%b-%Y")
+        before_str = (target_date + timedelta(days=1)).strftime("%d-%b-%Y")
+        search_query = f'(SINCE "{since_str}" BEFORE "{before_str}")'
+        
+        status, messages = conn.search(None, search_query)
+        if status != "OK": 
+            print("IMAP 搜索失败")
+            return []
+            
         for email_id in reversed(messages[0].split()):
             _, msg_data = conn.fetch(email_id, "(RFC822)")
             msg = email.message_from_bytes(msg_data[0][1])
@@ -134,15 +140,12 @@ def get_emails_from_target_date(target_date):
                 else: 
                     email_dt = email_dt.astimezone(beijing_tz)
                 
-                subject = str(make_header(decode_header(msg.get("Subject", "")))) or "(无主题)"
-                
-                # 🛠️ 关键修改：放宽日期匹配（允许前后1天的时区误差），并打印日志
-                days_diff = abs((email_dt.date() - target_date.date()).days)
-                if days_diff > 1:
-                    print(f"【调试】跳过邮件: 主题='{subject}', 服务器记录时间={email_dt.strftime('%Y-%m-%d %H:%M:%S')}, 目标日期={target_date.strftime('%Y-%m-%d')}")
+                # 🎯 二次严格校验：确保该邮件确实属于目标日期（处理服务器时区差异）
+                if email_dt.date() != target_date.date():
                     continue
 
-                print(f"【调试】成功抓取邮件: 主题='{subject}', 时间={email_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                subject = str(make_header(decode_header(msg.get("Subject", "")))) or "(无主题)"
+                print(f"【抓取】主题='{subject}', 时间={email_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 from_ = str(make_header(decode_header(msg.get("From", "")))) or "(未知发件人)"
                 mail_list.append({ "from_sender": from_, "subject": subject, "body_preview": _extract_body_preview(msg) })
             except Exception as e:
@@ -227,9 +230,7 @@ if __name__ == "__main__":
         exit(1)
 
     beijing_now = datetime.now(timezone(timedelta(hours=8)))
-    # ⚠️ 如果你想要总结“今天”的邮件（比如你想今天下午手动运行测试），把下面这行的 days=1 改成 days=0
     target_day = beijing_now - timedelta(days=1)
-    
     print(f"开始总结 {target_day.strftime('%Y-%m-%d')} 的邮件...")
     
     emails = get_emails_from_target_date(target_day)
