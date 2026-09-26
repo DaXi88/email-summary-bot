@@ -115,6 +115,7 @@ def get_emails_from_target_date(target_date):
     beijing_tz = timezone(timedelta(hours=8))
     try:
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
+        # 去除授权码中的空格，避免登录失败
         conn.login(IMAP_EMAIL, IMAP_AUTH_CODE.replace(" ", ""))
         conn.select(f'"{TARGET_FOLDER}"')
         
@@ -168,9 +169,14 @@ def _is_retryable_exception(exception):
 def _build_batch_error_block(start_index, batch_size, exception):
     return f"---\n\n#### 处理邮件 {start_index} 到 {start_index + batch_size - 1} 时失败\n```json\n{json.dumps({'batch_range': f'{start_index}-{start_index + batch_size - 1}', 'exception_type': type(exception).__name__, 'status_code': _extract_status_code(exception), 'message': str(exception)}, ensure_ascii=False, indent=2)}\n```\n\n---"
 
+# ⚠️ 核心修复点：将系统提示词和数据分离，满足 API 必须包含 user 消息的要求
 def summarize_single_batch(client, email_batch, start_index, max_retries=3, base_delay=2):
     emails_json_str = json.dumps(email_batch, ensure_ascii=False, indent=2)
+    
+    # 1. 准备好 system 角色的提示词（去掉邮件数据占位符）
     system_prompt = SYSTEM_PROMPT.replace("{{start_index}}", str(start_index)).replace("{{emails}}", "").strip()
+    
+    # 2. 准备好 user 角色的提示词（包含实际邮件数据）
     user_prompt = f"请帮我总结以下邮件数据，序号从 {start_index} 开始：\n\n{emails_json_str}"
     
     for attempt in range(max_retries + 1):
@@ -181,7 +187,7 @@ def summarize_single_batch(client, email_batch, start_index, max_retries=3, base
                 max_tokens=LLM_MAX_TOKENS,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt} # <--- 必须有 user 消息
                 ]
             )
             return {"success": True, "content": response.choices[0].message.content, "error": None}
@@ -215,6 +221,7 @@ def send_email_notification(summary_md, date_for_subject):
     message['From'] = SENDER_EMAIL
     message['To'] = RECEIVER_EMAIL
     try:
+        # 465端口必须用 SMTP_SSL
         server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30)
         server.login(SENDER_EMAIL, SENDER_AUTH_CODE)
         server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], message.as_string())
