@@ -22,7 +22,6 @@ import time
 # 全局常量与配置
 # ==============================================================================
 
-# 注意：这里去掉了 {{emails}} 占位符，因为邮件数据将通过 user 角色发送
 SYSTEM_PROMPT = """
 # 角色
 你是一名专业的邮件分析助手，任务是根据下方提供的邮件JSON数据，生成一段Markdown格式的摘要报告。
@@ -118,9 +117,11 @@ def get_emails_from_target_date(target_date):
         conn = imaplib.IMAP4_SSL(IMAP_SERVER)
         conn.login(IMAP_EMAIL, IMAP_AUTH_CODE.replace(" ", ""))
         conn.select(f'"{TARGET_FOLDER}"')
-        fetch_since_str = (target_date - timedelta(days=2)).strftime("%d-%b-%Y")
+        # 搜索最近3天的邮件，防止服务器时间偏差
+        fetch_since_str = (target_date - timedelta(days=3)).strftime("%d-%b-%Y")
         status, messages = conn.search(None, f'(SINCE "{fetch_since_str}")')
         if status != "OK": return []
+        
         for email_id in reversed(messages[0].split()):
             _, msg_data = conn.fetch(email_id, "(RFC822)")
             msg = email.message_from_bytes(msg_data[0][1])
@@ -128,10 +129,20 @@ def get_emails_from_target_date(target_date):
                 date_header = msg.get("Date")
                 if not date_header: continue
                 email_dt = parsedate_to_datetime(date_header)
-                if email_dt.tzinfo is None: email_dt = email_dt.replace(tzinfo=timezone.utc).astimezone(beijing_tz)
-                else: email_dt = email_dt.astimezone(beijing_tz)
-                if email_dt.date() != target_date.date(): continue
+                if email_dt.tzinfo is None: 
+                    email_dt = email_dt.replace(tzinfo=timezone.utc).astimezone(beijing_tz)
+                else: 
+                    email_dt = email_dt.astimezone(beijing_tz)
+                
                 subject = str(make_header(decode_header(msg.get("Subject", "")))) or "(无主题)"
+                
+                # 🛠️ 关键修改：放宽日期匹配（允许前后1天的时区误差），并打印日志
+                days_diff = abs((email_dt.date() - target_date.date()).days)
+                if days_diff > 1:
+                    print(f"【调试】跳过邮件: 主题='{subject}', 服务器记录时间={email_dt.strftime('%Y-%m-%d %H:%M:%S')}, 目标日期={target_date.strftime('%Y-%m-%d')}")
+                    continue
+
+                print(f"【调试】成功抓取邮件: 主题='{subject}', 时间={email_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 from_ = str(make_header(decode_header(msg.get("From", "")))) or "(未知发件人)"
                 mail_list.append({ "from_sender": from_, "subject": subject, "body_preview": _extract_body_preview(msg) })
             except Exception as e:
@@ -154,14 +165,9 @@ def _is_retryable_exception(exception):
 def _build_batch_error_block(start_index, batch_size, exception):
     return f"---\n\n#### 处理邮件 {start_index} 到 {start_index + batch_size - 1} 时失败\n```json\n{json.dumps({'batch_range': f'{start_index}-{start_index + batch_size - 1}', 'exception_type': type(exception).__name__, 'status_code': _extract_status_code(exception), 'message': str(exception)}, ensure_ascii=False, indent=2)}\n```\n\n---"
 
-# ⚠️ 核心修改：将系统提示词和数据分离，满足 API 必须包含 user 消息的要求
 def summarize_single_batch(client, email_batch, start_index, max_retries=3, base_delay=2):
     emails_json_str = json.dumps(email_batch, ensure_ascii=False, indent=2)
-    
-    # 1. 准备好 system 角色的提示词（去掉邮件数据占位符）
     system_prompt = SYSTEM_PROMPT.replace("{{start_index}}", str(start_index)).replace("{{emails}}", "").strip()
-    
-    # 2. 准备好 user 角色的提示词（包含实际邮件数据）
     user_prompt = f"请帮我总结以下邮件数据，序号从 {start_index} 开始：\n\n{emails_json_str}"
     
     for attempt in range(max_retries + 1):
@@ -172,7 +178,7 @@ def summarize_single_batch(client, email_batch, start_index, max_retries=3, base
                 max_tokens=LLM_MAX_TOKENS,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt} # <--- 必须要有 user 消息
+                    {"role": "user", "content": user_prompt}
                 ]
             )
             return {"success": True, "content": response.choices[0].message.content, "error": None}
@@ -221,7 +227,9 @@ if __name__ == "__main__":
         exit(1)
 
     beijing_now = datetime.now(timezone(timedelta(hours=8)))
+    # ⚠️ 如果你想要总结“今天”的邮件（比如你想今天下午手动运行测试），把下面这行的 days=1 改成 days=0
     target_day = beijing_now - timedelta(days=1)
+    
     print(f"开始总结 {target_day.strftime('%Y-%m-%d')} 的邮件...")
     
     emails = get_emails_from_target_date(target_day)
